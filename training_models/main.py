@@ -12,7 +12,7 @@ from longtail_train import train_baseline_longtail, train_with_revision_longtail
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet on CIFAR-100")
     parser.add_argument("--mode", type=str, choices=["baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples", "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", "train_with_percentage", 
-                                                     "train_with_adaptive", "train_with_alternative"], required=True,
+                                                     "train_with_adaptive", "train_with_alternative", "train_with_selective_recall"], required=True,
                         help="Choose training mode: 'baseline' or 'selective_gradient'")
     parser.add_argument("--epoch", type=int, required=False, default=10,
                         help="Number of epochs to train for")
@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--interval", type=int, default=50)
     parser.add_argument("--increment", type=float, default=0.1)
     parser.add_argument("--download", action="store_true", help="Download dataset if not exists (for aircraft and cub2011 datasets)")
+    parser.add_argument("--review_interval", type=int, default=5, help="How often (in epochs) to review dropped samples for selective recall")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -218,6 +219,11 @@ def main():
         elif args.mode == "train_with_alternative":
             train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
             trained_model, num_step = train_revision.train_with_alternative(args.start_revision, args.task, cls_num_list)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_selective_recall":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}, review interval: {args.review_interval}")
+            trained_model, num_step = train_revision.train_with_selective_recall(args.start_revision, args.task, cls_num_list, args.review_interval)
             print("Number of steps : ", num_step)
     
     if args.mode == "baseline":
