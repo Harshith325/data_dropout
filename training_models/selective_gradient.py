@@ -2606,3 +2606,782 @@ class TrainRevision:
         print(f"Label log saved to {label_log_path}")
 
         return self.model, num_step
+
+    def train_with_forgetting_schedule(self, start_revision, task, cls_num_list, review_interval):
+        """
+        Adaptive "Forgetting" Schedules inspired by human spaced repetition.
+        During the dropout phase (epoch < start_revision), samples are dropped based on
+        confidence threshold. But every `review_interval` epochs, the model trains on the
+        FULL dataset for that epoch (a "review" phase), implementing spaced repetition.
+        After start_revision, train on full dataset as usual.
+        """
+
+        save_path = self.save_path
+        self.model.to(self.device)
+        if task == 'classification':
+            criterion = nn.CrossEntropyLoss()
+        elif 'longtail':
+            train_sampler = None
+            idx = self.epochs // 160
+            betas = [0, 0.9999]
+            effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+            per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+            per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+            per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(self.device)
+            criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(self.device)
+        optimizer = optim.AdamW(self.model.parameters(), lr=3e-4)
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_test_accuracies = []
+        epoch_test_losses = []
+        time_per_epoch = []
+        survival_log = defaultdict(list)
+        label_log = defaultdict(int)
+        start_time = time.time()
+        num_step = 0
+        samples_used_per_epoch = []
+
+        for epoch in range(self.epochs):
+            samples_used = 0
+            epoch_start_time = time.time()
+
+            if epoch < start_revision:
+                # Determine if this is a review epoch (full training) or dropout epoch
+                is_review_epoch = (epoch > 0 and epoch % review_interval == 0)
+
+                if is_review_epoch:
+                    # Review phase: train on FULL dataset
+                    self.model.train()
+                    running_loss = 0.0
+                    correct = 0
+                    total = 0
+
+                    print(f"Epoch [{epoch+1}/{self.epochs}] (review phase - full dataset)")
+                    progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (review)")
+
+                    for batch_idx, (inputs, labels) in progress_bar:
+                        batch_start_idx = batch_idx * self.train_loader.batch_size
+                        inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                        optimizer.zero_grad()
+
+                        outputs = self.model(inputs)
+                        loss = criterion(outputs, labels)
+                        absolute_indices = list(range(batch_start_idx, batch_start_idx + inputs.size(0)))
+                        survival_log[epoch].extend(absolute_indices)
+                        used_labels = labels
+                        for label in used_labels.tolist():
+                            label_log[int(label)] += 1
+                        num_step += len(outputs)
+                        samples_used += len(outputs)
+                        loss.backward()
+                        optimizer.step()
+
+                        running_loss += loss.item()
+
+                        outputs = self.model(inputs)
+                        preds = torch.argmax(outputs, dim=1)
+                        correct += (preds == labels).sum().item()
+                        total += labels.size(0)
+
+                    epoch_loss = running_loss / len(self.train_loader)
+                    epoch_accuracy = correct / total
+                    epoch_losses.append(epoch_loss)
+                    epoch_accuracies.append(epoch_accuracy)
+
+                else:
+                    # Dropout phase: drop confident samples
+                    self.model.train()
+                    running_loss = 0.0
+                    total_correct = 0
+                    total_samples = 0
+                    print(f"Epoch [{epoch+1}/{self.epochs}] (dropout phase)")
+                    progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (dropout)")
+
+                    for batch_idx, (inputs, labels) in progress_bar:
+                        batch_start_idx = batch_idx * self.train_loader.batch_size
+                        inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                        with torch.no_grad():
+                            outputs = self.model(inputs)
+                            preds = torch.argmax(outputs, dim=1)
+
+                            if self.threshold == 0:
+                                mask = preds != labels
+                            else:
+                                prob = torch.softmax(outputs, dim=1)
+                                correct_class = prob[torch.arange(labels.size(0)), labels]
+                                mask = correct_class < self.threshold
+
+                        if not mask.any():
+                            continue
+
+                        inputs_misclassified = inputs[mask]
+                        labels_misclassified = labels[mask]
+
+                        used_labels = labels_misclassified
+                        for label in used_labels.tolist():
+                            label_log[int(label)] += 1
+
+                        misclassified_in_batch = torch.nonzero(mask, as_tuple=False).squeeze(1)
+                        absolute_indices = (misclassified_in_batch + batch_start_idx).tolist()
+                        survival_log[epoch].extend(absolute_indices)
+
+                        optimizer.zero_grad()
+
+                        outputs_misclassified = self.model(inputs_misclassified)
+                        loss = criterion(outputs_misclassified, labels_misclassified)
+                        num_step += len(outputs_misclassified)
+                        samples_used += len(outputs_misclassified)
+                        loss.backward()
+                        optimizer.step()
+
+                        running_loss += loss.item()
+
+                        total_correct += (preds == labels).sum().item()
+                        total_samples += labels.size(0)
+                        progress_bar.set_postfix({"Loss": loss.item()})
+
+                    epoch_loss = running_loss / len(self.train_loader)
+                    epoch_accuracy = total_correct / total_samples if total_samples > 0 else 0
+                    epoch_losses.append(epoch_loss)
+                    epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                correct = 0
+                total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        correct += (predictions == labels).sum().item()
+                        total += labels.size(0)
+
+                accuracy = correct / total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            else:
+                # Full training after start_revision
+                self.model.train()
+                running_loss = 0.0
+                correct = 0
+                total = 0
+
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    optimizer.zero_grad()
+
+                    outputs = self.model(inputs)
+                    loss = criterion(outputs, labels)
+                    absolute_indices = list(range(batch_start_idx, batch_start_idx + inputs.size(0)))
+                    survival_log[epoch].extend(absolute_indices)
+                    used_labels = labels
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+                    num_step += len(outputs)
+                    samples_used += len(outputs)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    outputs = self.model(inputs)
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = correct / total
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                test_correct = 0
+                test_total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        test_correct += (predictions == labels).sum().item()
+                        test_total += labels.size(0)
+
+                accuracy = test_correct / test_total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            samples_used_per_epoch.append(samples_used)
+
+        end_time = time.time()
+        log_memory(start_time, end_time)
+        print(num_step)
+
+        total_wall_time = end_time - start_time
+        print(f"\n Total Wall Time for {self.epochs} epochs: {total_wall_time:.2f} seconds "
+              f"({total_wall_time / 60:.2f} minutes)")
+
+        plot_accuracy_time_multi(
+            model_name=self.model_name,
+            accuracy=epoch_accuracies,
+            time_per_epoch=time_per_epoch,
+            save_path=save_path,
+            data_file=save_path
+        )
+        plot_accuracy_time_multi_test(
+            model_name=self.model_name,
+            accuracy=epoch_test_accuracies,
+            time_per_epoch=time_per_epoch,
+            samples_per_epoch=samples_used_per_epoch,
+            threshold=self.threshold,
+            save_path=save_path,
+            data_file=save_path
+        )
+
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_forgetting_schedule.json")
+        with open(survival_log_path, "w") as f:
+            json.dump(dict(survival_log), f, indent=2)
+        print(f"Survival log saved to {survival_log_path}")
+
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_forgetting_schedule.json")
+        with open(label_log_path, "w") as f:
+            json.dump(dict(label_log), f, indent=2)
+        print(f"Label log saved to {label_log_path}")
+
+        return self.model, num_step
+
+    def train_with_dynamic_threshold(self, start_revision, task, cls_num_list, initial_threshold, max_threshold):
+        """
+        Dynamic Difficulty Thresholds:
+        Instead of a fixed threshold, the threshold starts at `initial_threshold` and linearly
+        increases to `max_threshold` over the dropout epochs. Early on, only very easy
+        (high confidence) samples are dropped; later, moderately confident samples are also
+        dropped. This mimics human learners progressively considering more items "known".
+        After start_revision, train on full dataset as usual.
+        """
+
+        save_path = self.save_path
+        self.model.to(self.device)
+        if task == 'classification':
+            criterion = nn.CrossEntropyLoss()
+        elif 'longtail':
+            train_sampler = None
+            idx = self.epochs // 160
+            betas = [0, 0.9999]
+            effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+            per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+            per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+            per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(self.device)
+            criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(self.device)
+        optimizer = optim.AdamW(self.model.parameters(), lr=3e-4)
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_test_accuracies = []
+        epoch_test_losses = []
+        time_per_epoch = []
+        survival_log = defaultdict(list)
+        label_log = defaultdict(int)
+        start_time = time.time()
+        num_step = 0
+        samples_used_per_epoch = []
+
+        for epoch in range(self.epochs):
+            samples_used = 0
+            epoch_start_time = time.time()
+
+            if epoch < start_revision:
+                # Compute dynamic threshold that linearly increases over dropout epochs
+                current_threshold = initial_threshold + (max_threshold - initial_threshold) * (epoch / start_revision)
+                current_threshold = min(current_threshold, max_threshold)
+
+                self.model.train()
+                running_loss = 0.0
+                total_correct = 0
+                total_samples = 0
+                print(f"Epoch [{epoch+1}/{self.epochs}] (threshold={current_threshold:.4f})")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (dropout)")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model(inputs)
+                        preds = torch.argmax(outputs, dim=1)
+
+                        if current_threshold == 0:
+                            mask = preds != labels
+                        else:
+                            prob = torch.softmax(outputs, dim=1)
+                            correct_class = prob[torch.arange(labels.size(0)), labels]
+                            mask = correct_class < current_threshold
+
+                    if not mask.any():
+                        continue
+
+                    inputs_misclassified = inputs[mask]
+                    labels_misclassified = labels[mask]
+
+                    used_labels = labels_misclassified
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+
+                    misclassified_in_batch = torch.nonzero(mask, as_tuple=False).squeeze(1)
+                    absolute_indices = (misclassified_in_batch + batch_start_idx).tolist()
+                    survival_log[epoch].extend(absolute_indices)
+
+                    optimizer.zero_grad()
+
+                    outputs_misclassified = self.model(inputs_misclassified)
+                    loss = criterion(outputs_misclassified, labels_misclassified)
+                    num_step += len(outputs_misclassified)
+                    samples_used += len(outputs_misclassified)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    total_correct += (preds == labels).sum().item()
+                    total_samples += labels.size(0)
+                    progress_bar.set_postfix({"Loss": loss.item()})
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = total_correct / total_samples if total_samples > 0 else 0
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                correct = 0
+                total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        correct += (predictions == labels).sum().item()
+                        total += labels.size(0)
+
+                accuracy = correct / total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            else:
+                # Full training after start_revision
+                self.model.train()
+                running_loss = 0.0
+                correct = 0
+                total = 0
+
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    optimizer.zero_grad()
+
+                    outputs = self.model(inputs)
+                    loss = criterion(outputs, labels)
+                    absolute_indices = list(range(batch_start_idx, batch_start_idx + inputs.size(0)))
+                    survival_log[epoch].extend(absolute_indices)
+                    used_labels = labels
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+                    num_step += len(outputs)
+                    samples_used += len(outputs)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    outputs = self.model(inputs)
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = correct / total
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                test_correct = 0
+                test_total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        test_correct += (predictions == labels).sum().item()
+                        test_total += labels.size(0)
+
+                accuracy = test_correct / test_total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            samples_used_per_epoch.append(samples_used)
+
+        end_time = time.time()
+        log_memory(start_time, end_time)
+        print(num_step)
+
+        total_wall_time = end_time - start_time
+        print(f"\n Total Wall Time for {self.epochs} epochs: {total_wall_time:.2f} seconds "
+              f"({total_wall_time / 60:.2f} minutes)")
+
+        plot_accuracy_time_multi(
+            model_name=self.model_name,
+            accuracy=epoch_accuracies,
+            time_per_epoch=time_per_epoch,
+            save_path=save_path,
+            data_file=save_path
+        )
+        plot_accuracy_time_multi_test(
+            model_name=self.model_name,
+            accuracy=epoch_test_accuracies,
+            time_per_epoch=time_per_epoch,
+            samples_per_epoch=samples_used_per_epoch,
+            threshold=self.threshold,
+            save_path=save_path,
+            data_file=save_path
+        )
+
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_dynamic_threshold.json")
+        with open(survival_log_path, "w") as f:
+            json.dump(dict(survival_log), f, indent=2)
+        print(f"Survival log saved to {survival_log_path}")
+
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_dynamic_threshold.json")
+        with open(label_log_path, "w") as f:
+            json.dump(dict(label_log), f, indent=2)
+        print(f"Label log saved to {label_log_path}")
+
+        return self.model, num_step
+
+    def train_with_cognitive_ordering(self, start_revision, task, cls_num_list, curriculum_order):
+        """
+        Cognitively-Motivated Data Ordering combined with progressive dropping.
+        `curriculum_order` is "curriculum" (easy-to-hard) or "anti_curriculum" (hard-to-easy).
+        At the start of each dropout epoch, compute difficulty scores for all training samples
+        using model confidence (lower confidence = harder). Sort training indices by difficulty
+        and create a new DataLoader with that ordering. Then apply normal confidence-based
+        dropout on the sorted data. After start_revision, train on full dataset as usual.
+        """
+
+        save_path = self.save_path
+        self.model.to(self.device)
+        if task == 'classification':
+            criterion = nn.CrossEntropyLoss()
+        elif 'longtail':
+            train_sampler = None
+            idx = self.epochs // 160
+            betas = [0, 0.9999]
+            effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+            per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+            per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+            per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(self.device)
+            criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(self.device)
+        optimizer = optim.AdamW(self.model.parameters(), lr=3e-4)
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_test_accuracies = []
+        epoch_test_losses = []
+        time_per_epoch = []
+        survival_log = defaultdict(list)
+        label_log = defaultdict(int)
+        start_time = time.time()
+        num_step = 0
+        samples_used_per_epoch = []
+
+        for epoch in range(self.epochs):
+            samples_used = 0
+            epoch_start_time = time.time()
+
+            if epoch < start_revision:
+                # Compute difficulty scores for all training samples
+                self.model.eval()
+                all_confidences = []
+                with torch.no_grad():
+                    for inputs, labels in self.train_loader:
+                        inputs, labels = inputs.to(self.device), labels.to(self.device)
+                        outputs = self.model(inputs)
+                        prob = torch.softmax(outputs, dim=1)
+                        correct_class = prob[torch.arange(labels.size(0)), labels]
+                        all_confidences.append(correct_class.cpu())
+
+                all_confidences = torch.cat(all_confidences, dim=0)
+
+                # Sort indices by difficulty
+                if curriculum_order == "curriculum":
+                    # Easy first: high confidence first (descending)
+                    sorted_indices = torch.argsort(all_confidences, descending=True).tolist()
+                else:
+                    # Anti-curriculum / hard first: low confidence first (ascending)
+                    sorted_indices = torch.argsort(all_confidences, descending=False).tolist()
+
+                # Create ordered DataLoader using Subset
+                ordered_subset = torch.utils.data.Subset(self.train_loader.dataset, sorted_indices)
+                ordered_loader = torch.utils.data.DataLoader(
+                    ordered_subset, batch_size=self.train_loader.batch_size, shuffle=False, num_workers=2
+                )
+
+                # Dropout phase on sorted data
+                self.model.train()
+                running_loss = 0.0
+                total_correct = 0
+                total_samples = 0
+                print(f"Epoch [{epoch+1}/{self.epochs}] (ordering={curriculum_order})")
+                progress_bar = tqdm(enumerate(ordered_loader), total=len(ordered_loader), desc="Training (ordered dropout)")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model(inputs)
+                        preds = torch.argmax(outputs, dim=1)
+
+                        if self.threshold == 0:
+                            mask = preds != labels
+                        else:
+                            prob = torch.softmax(outputs, dim=1)
+                            correct_class = prob[torch.arange(labels.size(0)), labels]
+                            mask = correct_class < self.threshold
+
+                    if not mask.any():
+                        continue
+
+                    inputs_misclassified = inputs[mask]
+                    labels_misclassified = labels[mask]
+
+                    used_labels = labels_misclassified
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+
+                    misclassified_in_batch = torch.nonzero(mask, as_tuple=False).squeeze(1)
+                    # Map back to original dataset indices
+                    absolute_indices = [sorted_indices[batch_start_idx + i.item()] for i in misclassified_in_batch]
+                    survival_log[epoch].extend(absolute_indices)
+
+                    optimizer.zero_grad()
+
+                    outputs_misclassified = self.model(inputs_misclassified)
+                    loss = criterion(outputs_misclassified, labels_misclassified)
+                    num_step += len(outputs_misclassified)
+                    samples_used += len(outputs_misclassified)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    total_correct += (preds == labels).sum().item()
+                    total_samples += labels.size(0)
+                    progress_bar.set_postfix({"Loss": loss.item()})
+
+                epoch_loss = running_loss / len(ordered_loader)
+                epoch_accuracy = total_correct / total_samples if total_samples > 0 else 0
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                correct = 0
+                total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        correct += (predictions == labels).sum().item()
+                        total += labels.size(0)
+
+                accuracy = correct / total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            else:
+                # Full training after start_revision
+                self.model.train()
+                running_loss = 0.0
+                correct = 0
+                total = 0
+
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    optimizer.zero_grad()
+
+                    outputs = self.model(inputs)
+                    loss = criterion(outputs, labels)
+                    absolute_indices = list(range(batch_start_idx, batch_start_idx + inputs.size(0)))
+                    survival_log[epoch].extend(absolute_indices)
+                    used_labels = labels
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+                    num_step += len(outputs)
+                    samples_used += len(outputs)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    outputs = self.model(inputs)
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = correct / total
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                test_correct = 0
+                test_total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        test_correct += (predictions == labels).sum().item()
+                        test_total += labels.size(0)
+
+                accuracy = test_correct / test_total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            samples_used_per_epoch.append(samples_used)
+
+        end_time = time.time()
+        log_memory(start_time, end_time)
+        print(num_step)
+
+        total_wall_time = end_time - start_time
+        print(f"\n Total Wall Time for {self.epochs} epochs: {total_wall_time:.2f} seconds "
+              f"({total_wall_time / 60:.2f} minutes)")
+
+        plot_accuracy_time_multi(
+            model_name=self.model_name,
+            accuracy=epoch_accuracies,
+            time_per_epoch=time_per_epoch,
+            save_path=save_path,
+            data_file=save_path
+        )
+        plot_accuracy_time_multi_test(
+            model_name=self.model_name,
+            accuracy=epoch_test_accuracies,
+            time_per_epoch=time_per_epoch,
+            samples_per_epoch=samples_used_per_epoch,
+            threshold=self.threshold,
+            save_path=save_path,
+            data_file=save_path
+        )
+
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_cognitive_ordering.json")
+        with open(survival_log_path, "w") as f:
+            json.dump(dict(survival_log), f, indent=2)
+        print(f"Survival log saved to {survival_log_path}")
+
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_cognitive_ordering.json")
+        with open(label_log_path, "w") as f:
+            json.dump(dict(label_log), f, indent=2)
+        print(f"Label log saved to {label_log_path}")
+
+        return self.model, num_step
