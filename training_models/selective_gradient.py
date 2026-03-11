@@ -3385,3 +3385,539 @@ class TrainRevision:
         print(f"Label log saved to {label_log_path}")
 
         return self.model, num_step
+
+    def train_with_easy_hard_ratio(self, start_revision, task, cls_num_list):
+        """
+        Easy-Hard Ratio Sampling:
+        For each batch, compute confidence and split into easy (confidence >= threshold)
+        and hard (confidence < threshold) samples. Let the ratio of easy:hard be x:y.
+        Instead of training only on the z hard samples, construct a training subset of
+        size z by sampling from both easy and hard samples preserving the original x:y ratio.
+        After start_revision, train on full dataset as usual.
+        """
+
+        save_path = self.save_path
+        self.model.to(self.device)
+        if task == 'classification':
+            criterion = nn.CrossEntropyLoss()
+        elif 'longtail':
+            train_sampler = None
+            idx = self.epochs // 160
+            betas = [0, 0.9999]
+            effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+            per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+            per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+            per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(self.device)
+            criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(self.device)
+        optimizer = optim.AdamW(self.model.parameters(), lr=3e-4)
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_test_accuracies = []
+        epoch_test_losses = []
+        time_per_epoch = []
+        survival_log = defaultdict(list)
+        label_log = defaultdict(int)
+        start_time = time.time()
+        num_step = 0
+        samples_used_per_epoch = []
+
+        for epoch in range(self.epochs):
+            samples_used = 0
+            epoch_start_time = time.time()
+
+            if epoch < start_revision:
+                self.model.train()
+                running_loss = 0.0
+                total_correct = 0
+                total_samples = 0
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (easy-hard-ratio)")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model(inputs)
+                        preds = torch.argmax(outputs, dim=1)
+
+                        if self.threshold == 0:
+                            hard_mask = preds != labels
+                        else:
+                            prob = torch.softmax(outputs, dim=1)
+                            correct_class = prob[torch.arange(labels.size(0)), labels]
+                            hard_mask = correct_class < self.threshold
+
+                    easy_mask = ~hard_mask
+                    hard_indices = torch.nonzero(hard_mask, as_tuple=False).squeeze(1)
+                    easy_indices = torch.nonzero(easy_mask, as_tuple=False).squeeze(1)
+
+                    num_hard = len(hard_indices)
+                    num_easy = len(easy_indices)
+                    z = num_hard  # target subset size
+
+                    if z == 0:
+                        total_correct += (preds == labels).sum().item()
+                        total_samples += labels.size(0)
+                        continue
+
+                    # Compute how many easy and hard samples to include preserving x:y ratio
+                    total_in_batch = num_easy + num_hard
+                    n_easy_sample = int(round(z * num_easy / total_in_batch))
+                    n_hard_sample = z - n_easy_sample
+
+                    # Clamp to available counts
+                    n_easy_sample = min(n_easy_sample, num_easy)
+                    n_hard_sample = min(n_hard_sample, num_hard)
+
+                    selected_indices = []
+                    if n_easy_sample > 0 and num_easy > 0:
+                        easy_perm = torch.randperm(num_easy, device=self.device)[:n_easy_sample]
+                        selected_indices.append(easy_indices[easy_perm])
+                    if n_hard_sample > 0 and num_hard > 0:
+                        hard_perm = torch.randperm(num_hard, device=self.device)[:n_hard_sample]
+                        selected_indices.append(hard_indices[hard_perm])
+
+                    if len(selected_indices) == 0:
+                        total_correct += (preds == labels).sum().item()
+                        total_samples += labels.size(0)
+                        continue
+
+                    selected_indices = torch.cat(selected_indices)
+                    inputs_selected = inputs[selected_indices]
+                    labels_selected = labels[selected_indices]
+
+                    used_labels = labels_selected
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+
+                    absolute_indices = (selected_indices + batch_start_idx).tolist()
+                    survival_log[epoch].extend(absolute_indices)
+
+                    optimizer.zero_grad()
+
+                    outputs_selected = self.model(inputs_selected)
+                    loss = criterion(outputs_selected, labels_selected)
+                    num_step += len(outputs_selected)
+                    samples_used += len(outputs_selected)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    total_correct += (preds == labels).sum().item()
+                    total_samples += labels.size(0)
+                    progress_bar.set_postfix({"Loss": loss.item()})
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = total_correct / total_samples if total_samples > 0 else 0
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                correct = 0
+                total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        correct += (predictions == labels).sum().item()
+                        total += labels.size(0)
+
+                accuracy = correct / total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            else:
+                # Full training after start_revision
+                self.model.train()
+                running_loss = 0.0
+                correct = 0
+                total = 0
+
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    optimizer.zero_grad()
+
+                    outputs = self.model(inputs)
+                    loss = criterion(outputs, labels)
+                    absolute_indices = list(range(batch_start_idx, batch_start_idx + inputs.size(0)))
+                    survival_log[epoch].extend(absolute_indices)
+                    used_labels = labels
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+                    num_step += len(outputs)
+                    samples_used += len(outputs)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    outputs = self.model(inputs)
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = correct / total
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                test_correct = 0
+                test_total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        test_correct += (predictions == labels).sum().item()
+                        test_total += labels.size(0)
+
+                accuracy = test_correct / test_total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            samples_used_per_epoch.append(samples_used)
+
+        end_time = time.time()
+        log_memory(start_time, end_time)
+        print(num_step)
+
+        total_wall_time = end_time - start_time
+        print(f"\n Total Wall Time for {self.epochs} epochs: {total_wall_time:.2f} seconds "
+              f"({total_wall_time / 60:.2f} minutes)")
+
+        plot_accuracy_time_multi(
+            model_name=self.model_name,
+            accuracy=epoch_accuracies,
+            time_per_epoch=time_per_epoch,
+            save_path=save_path,
+            data_file=save_path
+        )
+        plot_accuracy_time_multi_test(
+            model_name=self.model_name,
+            accuracy=epoch_test_accuracies,
+            time_per_epoch=time_per_epoch,
+            samples_per_epoch=samples_used_per_epoch,
+            threshold=self.threshold,
+            save_path=save_path,
+            data_file=save_path
+        )
+
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_easy_hard_ratio.json")
+        with open(survival_log_path, "w") as f:
+            json.dump(dict(survival_log), f, indent=2)
+        print(f"Survival log saved to {survival_log_path}")
+
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_easy_hard_ratio.json")
+        with open(label_log_path, "w") as f:
+            json.dump(dict(label_log), f, indent=2)
+        print(f"Label log saved to {label_log_path}")
+
+        return self.model, num_step
+
+    def train_with_hard_easy_ratio(self, start_revision, task, cls_num_list):
+        """
+        Hard-Easy Ratio Sampling:
+        For each batch, compute confidence and split into easy (confidence >= threshold)
+        and hard (confidence < threshold) samples. Let the ratio of easy:hard be x:y.
+        Instead of training only on the z hard samples, construct a training subset of
+        size z by sampling from both easy and hard samples with the reversed y:x ratio,
+        emphasizing hard samples while still including some easier examples.
+        After start_revision, train on full dataset as usual.
+        """
+
+        save_path = self.save_path
+        self.model.to(self.device)
+        if task == 'classification':
+            criterion = nn.CrossEntropyLoss()
+        elif 'longtail':
+            train_sampler = None
+            idx = self.epochs // 160
+            betas = [0, 0.9999]
+            effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+            per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+            per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+            per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(self.device)
+            criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(self.device)
+        optimizer = optim.AdamW(self.model.parameters(), lr=3e-4)
+        scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
+        epoch_losses = []
+        epoch_accuracies = []
+        epoch_test_accuracies = []
+        epoch_test_losses = []
+        time_per_epoch = []
+        survival_log = defaultdict(list)
+        label_log = defaultdict(int)
+        start_time = time.time()
+        num_step = 0
+        samples_used_per_epoch = []
+
+        for epoch in range(self.epochs):
+            samples_used = 0
+            epoch_start_time = time.time()
+
+            if epoch < start_revision:
+                self.model.train()
+                running_loss = 0.0
+                total_correct = 0
+                total_samples = 0
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (hard-easy-ratio)")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model(inputs)
+                        preds = torch.argmax(outputs, dim=1)
+
+                        if self.threshold == 0:
+                            hard_mask = preds != labels
+                        else:
+                            prob = torch.softmax(outputs, dim=1)
+                            correct_class = prob[torch.arange(labels.size(0)), labels]
+                            hard_mask = correct_class < self.threshold
+
+                    easy_mask = ~hard_mask
+                    hard_indices = torch.nonzero(hard_mask, as_tuple=False).squeeze(1)
+                    easy_indices = torch.nonzero(easy_mask, as_tuple=False).squeeze(1)
+
+                    num_hard = len(hard_indices)
+                    num_easy = len(easy_indices)
+                    z = num_hard  # target subset size
+
+                    if z == 0:
+                        total_correct += (preds == labels).sum().item()
+                        total_samples += labels.size(0)
+                        continue
+
+                    # Compute how many easy and hard samples using reversed y:x ratio
+                    # Original ratio is x:y (easy:hard = num_easy:num_hard)
+                    # Reversed ratio is y:x, so easy gets proportion num_hard/(num_easy+num_hard)
+                    # and hard gets proportion num_easy/(num_easy+num_hard)
+                    total_in_batch = num_easy + num_hard
+                    n_easy_sample = int(round(z * num_hard / total_in_batch))
+                    n_hard_sample = z - n_easy_sample
+
+                    # Clamp to available counts
+                    n_easy_sample = min(n_easy_sample, num_easy)
+                    n_hard_sample = min(n_hard_sample, num_hard)
+
+                    selected_indices = []
+                    if n_easy_sample > 0 and num_easy > 0:
+                        easy_perm = torch.randperm(num_easy, device=self.device)[:n_easy_sample]
+                        selected_indices.append(easy_indices[easy_perm])
+                    if n_hard_sample > 0 and num_hard > 0:
+                        hard_perm = torch.randperm(num_hard, device=self.device)[:n_hard_sample]
+                        selected_indices.append(hard_indices[hard_perm])
+
+                    if len(selected_indices) == 0:
+                        total_correct += (preds == labels).sum().item()
+                        total_samples += labels.size(0)
+                        continue
+
+                    selected_indices = torch.cat(selected_indices)
+                    inputs_selected = inputs[selected_indices]
+                    labels_selected = labels[selected_indices]
+
+                    used_labels = labels_selected
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+
+                    absolute_indices = (selected_indices + batch_start_idx).tolist()
+                    survival_log[epoch].extend(absolute_indices)
+
+                    optimizer.zero_grad()
+
+                    outputs_selected = self.model(inputs_selected)
+                    loss = criterion(outputs_selected, labels_selected)
+                    num_step += len(outputs_selected)
+                    samples_used += len(outputs_selected)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    total_correct += (preds == labels).sum().item()
+                    total_samples += labels.size(0)
+                    progress_bar.set_postfix({"Loss": loss.item()})
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = total_correct / total_samples if total_samples > 0 else 0
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                correct = 0
+                total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        correct += (predictions == labels).sum().item()
+                        total += labels.size(0)
+
+                accuracy = correct / total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            else:
+                # Full training after start_revision
+                self.model.train()
+                running_loss = 0.0
+                correct = 0
+                total = 0
+
+                print(f"Epoch [{epoch+1}/{self.epochs}]")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training")
+
+                for batch_idx, (inputs, labels) in progress_bar:
+                    batch_start_idx = batch_idx * self.train_loader.batch_size
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                    optimizer.zero_grad()
+
+                    outputs = self.model(inputs)
+                    loss = criterion(outputs, labels)
+                    absolute_indices = list(range(batch_start_idx, batch_start_idx + inputs.size(0)))
+                    survival_log[epoch].extend(absolute_indices)
+                    used_labels = labels
+                    for label in used_labels.tolist():
+                        label_log[int(label)] += 1
+                    num_step += len(outputs)
+                    samples_used += len(outputs)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+
+                    outputs = self.model(inputs)
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+
+                epoch_loss = running_loss / len(self.train_loader)
+                epoch_accuracy = correct / total
+                epoch_losses.append(epoch_loss)
+                epoch_accuracies.append(epoch_accuracy)
+
+                epoch_end_time = time.time()
+                time_per_epoch.append(epoch_end_time - epoch_start_time)
+
+                print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+
+                self.model.eval()
+                test_correct = 0
+                test_total = 0
+                test_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(self.test_loader, desc="Evaluating"):
+                        inputs = batch[0].to(self.device)
+                        labels = batch[1].to(self.device)
+                        outputs = self.model(inputs)
+
+                        batch_loss = criterion(outputs, labels)
+                        test_loss += batch_loss.item()
+
+                        predictions = torch.argmax(outputs, dim=-1)
+                        test_correct += (predictions == labels).sum().item()
+                        test_total += labels.size(0)
+
+                accuracy = test_correct / test_total
+                val_loss = test_loss / len(self.test_loader)
+                print(f"Epoch {epoch + 1}/{self.epochs}, Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+                scheduler.step(val_loss)
+                epoch_test_accuracies.append(accuracy)
+                epoch_test_losses.append(val_loss)
+
+            samples_used_per_epoch.append(samples_used)
+
+        end_time = time.time()
+        log_memory(start_time, end_time)
+        print(num_step)
+
+        total_wall_time = end_time - start_time
+        print(f"\n Total Wall Time for {self.epochs} epochs: {total_wall_time:.2f} seconds "
+              f"({total_wall_time / 60:.2f} minutes)")
+
+        plot_accuracy_time_multi(
+            model_name=self.model_name,
+            accuracy=epoch_accuracies,
+            time_per_epoch=time_per_epoch,
+            save_path=save_path,
+            data_file=save_path
+        )
+        plot_accuracy_time_multi_test(
+            model_name=self.model_name,
+            accuracy=epoch_test_accuracies,
+            time_per_epoch=time_per_epoch,
+            samples_per_epoch=samples_used_per_epoch,
+            threshold=self.threshold,
+            save_path=save_path,
+            data_file=save_path
+        )
+
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_hard_easy_ratio.json")
+        with open(survival_log_path, "w") as f:
+            json.dump(dict(survival_log), f, indent=2)
+        print(f"Survival log saved to {survival_log_path}")
+
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_hard_easy_ratio.json")
+        with open(label_log_path, "w") as f:
+            json.dump(dict(label_log), f, indent=2)
+        print(f"Label log saved to {label_log_path}")
+
+        return self.model, num_step
