@@ -13,7 +13,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train ResNet on CIFAR-100")
     parser.add_argument("--mode", type=str, choices=["baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples", "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", "train_with_percentage", 
                                                      "train_with_adaptive", "train_with_alternative", "train_with_selective_recall",
-                                                     "train_with_forgetting_schedule", "train_with_dynamic_threshold", "train_with_cognitive_ordering"], required=True,
+                                                     "train_with_forgetting_schedule", "train_with_dynamic_threshold", "train_with_cognitive_ordering",
+                                                     "train_with_distribution_preserving", "train_with_hard_biased"], required=True,
                         help="Choose training mode: 'baseline' or 'selective_gradient'")
     parser.add_argument("--epoch", type=int, required=False, default=10,
                         help="Number of epochs to train for")
@@ -243,6 +244,16 @@ def main():
             train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
             print(f"Training {args.mode}, will start revision after {args.start_revision}, order: {args.curriculum_order}")
             trained_model, num_step = train_revision.train_with_cognitive_ordering(args.start_revision, args.task, cls_num_list, args.curriculum_order)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_distribution_preserving":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_distribution_preserving(args.start_revision, args.task, cls_num_list)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_hard_biased":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_hard_biased(args.start_revision, args.task, cls_num_list)
             print("Number of steps : ", num_step)
     
     if args.mode == "baseline":
