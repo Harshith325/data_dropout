@@ -3386,9 +3386,9 @@ class TrainRevision:
 
         return self.model, num_step
 
-    def train_with_distribution_preserving(self, start_revision, task, cls_num_list):
+    def train_with_easy_hard_ratio(self, start_revision, task, cls_num_list):
         """
-        Distribution-Preserving Sampling:
+        Easy-Hard Ratio Sampling:
         For each batch, compute confidence and split into easy (confidence >= threshold)
         and hard (confidence < threshold) samples. Let the ratio of easy:hard be x:y.
         Instead of training only on the z hard samples, construct a training subset of
@@ -3432,7 +3432,7 @@ class TrainRevision:
                 total_correct = 0
                 total_samples = 0
                 print(f"Epoch [{epoch+1}/{self.epochs}]")
-                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (distribution-preserving)")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (easy-hard-ratio)")
 
                 for batch_idx, (inputs, labels) in progress_bar:
                     batch_start_idx = batch_idx * self.train_loader.batch_size
@@ -3640,21 +3640,21 @@ class TrainRevision:
             data_file=save_path
         )
 
-        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_distribution_preserving.json")
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_easy_hard_ratio.json")
         with open(survival_log_path, "w") as f:
             json.dump(dict(survival_log), f, indent=2)
         print(f"Survival log saved to {survival_log_path}")
 
-        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_distribution_preserving.json")
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_easy_hard_ratio.json")
         with open(label_log_path, "w") as f:
             json.dump(dict(label_log), f, indent=2)
         print(f"Label log saved to {label_log_path}")
 
         return self.model, num_step
 
-    def train_with_hard_biased(self, start_revision, task, cls_num_list):
+    def train_with_hard_easy_ratio(self, start_revision, task, cls_num_list):
         """
-        Hard-Biased Sampling:
+        Hard-Easy Ratio Sampling:
         For each batch, compute confidence and split into easy (confidence >= threshold)
         and hard (confidence < threshold) samples. Let the ratio of easy:hard be x:y.
         Instead of training only on the z hard samples, construct a training subset of
@@ -3699,7 +3699,7 @@ class TrainRevision:
                 total_correct = 0
                 total_samples = 0
                 print(f"Epoch [{epoch+1}/{self.epochs}]")
-                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (hard-biased)")
+                progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training (hard-easy-ratio)")
 
                 for batch_idx, (inputs, labels) in progress_bar:
                     batch_start_idx = batch_idx * self.train_loader.batch_size
@@ -3910,12 +3910,12 @@ class TrainRevision:
             data_file=save_path
         )
 
-        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_hard_biased.json")
+        survival_log_path = os.path.join(os.path.dirname(save_path), "survival_log_hard_easy_ratio.json")
         with open(survival_log_path, "w") as f:
             json.dump(dict(survival_log), f, indent=2)
         print(f"Survival log saved to {survival_log_path}")
 
-        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_hard_biased.json")
+        label_log_path = os.path.join(os.path.dirname(save_path), "label_log_hard_easy_ratio.json")
         with open(label_log_path, "w") as f:
             json.dump(dict(label_log), f, indent=2)
         print(f"Label log saved to {label_log_path}")
